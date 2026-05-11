@@ -79,6 +79,9 @@
 #             SingletonLock collisions and avoids permission issues from
 #             stale /tmp/archivebox-chrome-profiles directories when Web UI
 #             workers, retries, or snapshot hooks launch Chrome concurrently.
+#   v0.11.0 - Added archivebox-janitor sidecar runtime cleanup for stale daemon
+#             hooks after Web UI/worker jobs are sealed, while preserving the
+#             default ArchiveBox image entrypoint
 #
 
 set -euo pipefail
@@ -466,6 +469,83 @@ fi
 prompt_public_access
 
 echo
+echo "[+] Creating archivebox-janitor.sh..."
+
+cat > archivebox-janitor.sh <<'JANITOR'
+#!/usr/bin/env sh
+set -eu
+
+INTERVAL="${JANITOR_INTERVAL:-600}"
+STALE_AFTER="${STALE_AFTER:-1800}"
+
+while true; do
+  echo "[janitor] $(date -Iseconds) checking stale ArchiveBox daemon hooks..."
+
+  CONTAINER="$(docker ps \
+    --filter "label=com.docker.compose.service=archivebox" \
+    --format "{{.ID}}" \
+    | head -n 1)"
+
+  if [ -z "$CONTAINER" ]; then
+    echo "[janitor] archivebox container not found"
+    sleep 30
+    continue
+  fi
+
+  docker exec \
+    -u archivebox \
+    -e STALE_AFTER="$STALE_AFTER" \
+    "$CONTAINER" \
+    bash -s <<'IN_CONTAINER' || true
+set -euo pipefail
+
+STALE_AFTER="${STALE_AFTER:-1800}"
+
+ACTIVE_ADD="$(ps -eo pid,ppid,stat,etimes,cmd \
+  | awk '$0 ~ /(^|[ /])archivebox add([[:space:]]|$)/ {print}' || true)"
+
+if [ -n "$ACTIVE_ADD" ]; then
+  ADD_AGE="$(echo "$ACTIVE_ADD" | awk 'NR==1 {print $4}')"
+
+  if [ "${ADD_AGE:-0}" -lt "$STALE_AFTER" ]; then
+    echo "[janitor] archivebox add is active and still fresh (${ADD_AGE}s), skipping cleanup:"
+    echo "$ACTIVE_ADD"
+    exit 0
+  fi
+
+  echo "[janitor] archivebox add looks stale (${ADD_AGE}s), cleanup will continue:"
+  echo "$ACTIVE_ADD"
+fi
+
+echo "[janitor] orphan daemon hooks:"
+ps -eo pid,ppid,stat,etimes,cmd \
+  | awk '$2 == 1 && /on_(Snapshot|CrawlSetup)__.*daemon\.bg\.js/ {print}' || true
+
+echo "[janitor] killing orphan daemon hooks..."
+ps -eo pid,ppid,stat,etimes,cmd \
+  | awk '$2 == 1 && /on_(Snapshot|CrawlSetup)__.*daemon\.bg\.js/ {print $1}' \
+  | xargs -r kill || true
+
+sleep 2
+
+echo "[janitor] killing daemon hooks older than '"$STALE_AFTER"'s..."
+ps -eo pid,ppid,stat,etimes,cmd \
+  | awk -v stale="$STALE_AFTER" '$4 > stale && /on_(Snapshot|CrawlSetup)__.*daemon\.bg\.js/ {print $1}' \
+  | xargs -r kill || true
+
+echo "[janitor] cleaning old temporary Chrome profiles..."
+find /tmp -maxdepth 1 -type d -name "archivebox-chrome-profile.*" -mmin +30 -print -exec rm -rf {} + 2>/dev/null || true
+
+echo "[janitor] done"
+IN_CONTAINER
+
+  sleep "$INTERVAL"
+done
+JANITOR
+
+chmod +x archivebox-janitor.sh
+
+echo
 echo "[+] Creating docker-compose.override.yml..."
 
 if [ -f "docker-compose.override.yml" ]; then
@@ -496,6 +576,18 @@ services:
     shm_size: "1gb"
     environment: *archivebox-env
     command: server --init 0.0.0.0:8000
+
+  archivebox-janitor:
+    image: docker:cli
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/work
+    working_dir: /work
+    environment:
+      STALE_AFTER: "1800"
+      JANITOR_INTERVAL: "600"
+    command: sh /work/archivebox-janitor.sh
 EOF
 
 echo "[OK] docker-compose.override.yml created:"
@@ -623,4 +715,3 @@ fi
 
 echo
 echo "[+] Done."
-
